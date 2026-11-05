@@ -1,0 +1,17 @@
+name = "bus-live"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bus-live"
+database_id = "REPLACE_WITH_DATABASE_ID"   # from: npx wrangler d1 create bus-live
+migrations_dir = "migrations"
+
+[vars]
+HISTORY_DAYS = "45"          # how long track history is kept
+LIVE_CACHE_SECONDS = "5"     # counters of one company share one DB read for this long
+TRACK_CACHE_SECONDS = "10"   # public passenger tracking cache
+
+[triggers]
+crons = ["17 21 * * *"]      # daily clean-up at 03:17 Dhaka time (21:17 UTC)
