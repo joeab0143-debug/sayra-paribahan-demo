@@ -1,15 +1,18 @@
-// Live bus location API — Cloudflare Worker + D1, polling design.
+// Live bus location API — Cloudflare Worker + D1, polling design, built for 1,000+ buses.
 //
-//   POST /api/loc          supervisor app sends one or more GPS points for its trip
-//   POST /api/loc/share    supervisor turns location sharing on/off
-//   GET  /api/live         counters/admins poll every 15 s for their company's buses
+//   POST /api/trip-token   supervisor device token -> short-lived token for one trip (1 DB read, once per trip)
+//   POST /api/loc          trip token: one or more GPS points            (1 DB batch, no other reads)
+//   POST /api/loc/share    trip token: location sharing on/off
+//   GET  /api/live         counter/admin device token: company's buses    (served from cache most of the time)
 //   GET  /api/track/:trip  public: one trip's position (passenger tracking page)
 //   scheduled()            daily clean-up of old history and finished trips
 //
-// Cost notes (see README):
-//   * a ping = 1 row written (latest position). History is written at most once a minute.
-//   * /api/live answers from the Workers cache for LIVE_CACHE_SECONDS, so many counters
-//     polling the same company share one D1 read, and ETag lets unchanged data return 304.
+// Why it stays fast: a D1 database runs one query at a time, so every query saved per ping matters.
+//   * tokens are HMAC-signed and carry company/role/device/trip, so auth needs no DB lookup;
+//   * suspended companies and revoked devices are read once a minute per Worker instance;
+//   * the app marks which points go to history (one a minute), so the server needs no extra read.
+
+import { signToken, verifyToken } from './token.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -22,8 +25,10 @@ const CORS = {
 const BOUNDS = { minLat: 20.3, maxLat: 26.8, minLng: 87.9, maxLng: 92.8 };
 const MAX_POINTS_PER_REQUEST = 500;
 const MAX_ACCURACY_M = 100;
-const HISTORY_EVERY_MS = 60_000;
+const HISTORY_MIN_GAP_MS = 55_000;      // the app marks one point a minute; server enforces a floor
 const LIVE_WINDOW_MS = 6 * 3600_000;
+const TRIP_TOKEN_MS = 20 * 3600_000;
+const META_TTL_MS = 60_000;
 
 const json = (data, status = 200, extra = {}) =>
   new Response(JSON.stringify(data), {
@@ -31,23 +36,30 @@ const json = (data, status = 200, extra = {}) =>
     headers: { 'content-type': 'application/json; charset=utf-8', ...CORS, ...extra },
   });
 
-export async function sha256hex(text) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+// ---- suspended companies / revoked devices, cached per Worker instance -------------------
+let META = { at: 0, suspended: new Set(), revoked: new Set() };
+export function _resetMeta() { META = { at: 0, suspended: new Set(), revoked: new Set() }; }
+async function meta(env) {
+  if (Date.now() - META.at < META_TTL_MS) return META;
+  const [c, d] = await env.DB.batch([
+    env.DB.prepare("SELECT id FROM companies WHERE status <> 'active'"),
+    env.DB.prepare('SELECT id FROM devices WHERE active = 0'),
+  ]);
+  META = { at: Date.now(), suspended: new Set(c.results.map((r) => r.id)), revoked: new Set(d.results.map((r) => r.id)) };
+  return META;
 }
 
 async function authenticate(req, env, roles) {
   const m = (req.headers.get('authorization') || '').match(/^Bearer\s+(\S+)$/i);
   if (!m) return null;
-  const row = await env.DB.prepare(
-    `SELECT d.company_id, d.role, d.user_name
-       FROM devices d JOIN companies c ON c.id = d.company_id
-      WHERE d.token_hash = ?1 AND d.active = 1 AND c.status = 'active'`
-  ).bind(await sha256hex(m[1])).first();
-  return row && roles.includes(row.role) ? row : null;
+  const p = await verifyToken(m[1], env.TOKEN_SECRET);
+  if (!p || !roles.includes(p.r)) return null;
+  const { suspended, revoked } = await meta(env);
+  if (suspended.has(p.c) || revoked.has(p.d)) return null;
+  return p;
 }
 
-// Keep only plausible points; normalise field names.
+// ---- input checks -----------------------------------------------------------------------
 export function cleanPoints(raw, now = Date.now()) {
   if (!Array.isArray(raw)) return [];
   const out = [];
@@ -59,71 +71,69 @@ export function cleanPoints(raw, now = Date.now()) {
     if (p.accuracy != null && Number(p.accuracy) > MAX_ACCURACY_M) continue;
     const speed = p.speed == null ? null : Math.max(0, Math.min(150, Number(p.speed) || 0));
     const heading = p.heading == null ? null : ((Number(p.heading) % 360) + 360) % 360;
-    out.push({ lat, lng, t, speed, heading });
+    out.push({ lat, lng, t, speed, heading, h: p.h ? 1 : 0 });
   }
   out.sort((a, b) => a.t - b.t);
   return out.slice(-MAX_POINTS_PER_REQUEST);
 }
 
-// From a sorted batch, pick points that are at least HISTORY_EVERY_MS apart,
-// starting after the last history time already stored.
-export function pickHistory(points, lastHistAt) {
+// History rows: only points the app marked, and never closer than HISTORY_MIN_GAP_MS.
+export function pickHistory(points) {
   const picked = [];
-  let last = lastHistAt || 0;
+  let last = -Infinity;
   for (const p of points) {
-    if (p.t - last >= HISTORY_EVERY_MS) {
-      picked.push(p);
-      last = p.t;
-    }
+    if (p.h && p.t - last >= HISTORY_MIN_GAP_MS) { picked.push(p); last = p.t; }
   }
   return picked;
 }
 
-async function postLocation(req, env) {
+// ---- handlers ---------------------------------------------------------------------------
+async function postTripToken(req, env) {
   const who = await authenticate(req, env, ['supervisor']);
   if (!who) return json({ error: 'unauthorized' }, 401);
   const body = await req.json().catch(() => null);
   const tripId = String(body?.trip_id || '');
+  const trip = tripId && (await env.DB.prepare('SELECT company_id FROM trips WHERE id = ?1').bind(tripId).first());
+  if (!trip || trip.company_id !== who.c) return json({ error: 'trip not found' }, 404);
+  const exp = Date.now() + TRIP_TOKEN_MS;
+  const token = await signToken({ c: who.c, r: 'trip', d: who.d, t: tripId, exp }, env.TOKEN_SECRET);
+  return json({ token, exp });
+}
+
+async function postLocation(req, env) {
+  const who = await authenticate(req, env, ['trip']);
+  if (!who) return json({ error: 'unauthorized' }, 401);
+  const body = await req.json().catch(() => null);
   const points = cleanPoints(body?.points);
-  if (!tripId || !points.length) return json({ error: 'trip_id and at least one valid point are required' }, 400);
-
-  const trip = await env.DB.prepare('SELECT company_id FROM trips WHERE id = ?1').bind(tripId).first();
-  if (!trip || trip.company_id !== who.company_id) return json({ error: 'trip not found' }, 404);
-
-  const prev = await env.DB.prepare('SELECT hist_at FROM live_positions WHERE trip_id = ?1').bind(tripId).first();
-  const now = Date.now();
+  if (!points.length) return json({ error: 'at least one valid point is required' }, 400);
   const last = points[points.length - 1];
-  const hist = pickHistory(points, prev?.hist_at || 0);
-
-  const stmts = [
+  const hist = pickHistory(points);
+  const now = Date.now();
+  await env.DB.batch([
     env.DB.prepare(
-      `INSERT INTO live_positions (trip_id, company_id, lat, lng, speed, heading, recorded_at, received_at, hist_at, shared)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)
+      `INSERT INTO live_positions (trip_id, company_id, lat, lng, speed, heading, recorded_at, received_at, shared)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
        ON CONFLICT(trip_id) DO UPDATE SET
          lat = excluded.lat, lng = excluded.lng, speed = excluded.speed, heading = excluded.heading,
-         recorded_at = excluded.recorded_at, received_at = excluded.received_at, shared = 1,
-         hist_at = MAX(live_positions.hist_at, excluded.hist_at)
+         recorded_at = excluded.recorded_at, received_at = excluded.received_at, shared = 1
        WHERE excluded.recorded_at >= live_positions.recorded_at`
-    ).bind(tripId, who.company_id, last.lat, last.lng, last.speed, last.heading, last.t, now,
-           hist.length ? hist[hist.length - 1].t : (prev?.hist_at || 0)),
+    ).bind(who.t, who.c, last.lat, last.lng, last.speed, last.heading, last.t, now),
     ...hist.map((p) =>
       env.DB.prepare(
         `INSERT OR IGNORE INTO position_history (trip_id, company_id, lat, lng, speed, recorded_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)`
-      ).bind(tripId, who.company_id, p.lat, p.lng, p.speed, p.t)
+      ).bind(who.t, who.c, p.lat, p.lng, p.speed, p.t)
     ),
-  ];
-  await env.DB.batch(stmts);
+  ]);
   return json({ ok: true, accepted: points.length, history_rows: hist.length });
 }
 
 async function postShare(req, env) {
-  const who = await authenticate(req, env, ['supervisor']);
+  const who = await authenticate(req, env, ['trip']);
   if (!who) return json({ error: 'unauthorized' }, 401);
   const body = await req.json().catch(() => null);
-  const tripId = String(body?.trip_id || '');
   const res = await env.DB.prepare('UPDATE live_positions SET shared = ?1 WHERE trip_id = ?2 AND company_id = ?3')
-    .bind(body?.shared ? 1 : 0, tripId, who.company_id).run();
+    .bind(body?.shared ? 1 : 0, who.t, who.c).run();
   return json({ ok: true, updated: res.meta?.changes ?? 0 });
 }
 
@@ -151,12 +161,12 @@ async function getLive(req, env, ctx) {
   const who = await authenticate(req, env, ['counter', 'admin', 'supervisor']);
   if (!who) return json({ error: 'unauthorized' }, 401);
   const seconds = Number(env.LIVE_CACHE_SECONDS || 5);
-  // The cache key includes the company from the token, never from the URL.
-  return cached(req, ctx, `https://cache.internal/live/${encodeURIComponent(who.company_id)}`, seconds, async () => {
+  // The cache key uses the company from the signed token, never from the URL.
+  return cached(req, ctx, `https://cache.internal/live/${encodeURIComponent(who.c)}`, seconds, async () => {
     const { results } = await env.DB.prepare(
       `SELECT trip_id, lat, lng, speed, heading, recorded_at, received_at, shared
          FROM live_positions WHERE company_id = ?1 AND received_at > ?2`
-    ).bind(who.company_id, Date.now() - LIVE_WINDOW_MS).all();
+    ).bind(who.c, Date.now() - LIVE_WINDOW_MS).all();
     const etag = `"${results.length}-${Math.max(0, ...results.map((r) => r.received_at))}"`;
     return json({ now: Date.now(), trips: results }, 200, { etag });
   });
@@ -166,12 +176,11 @@ async function getTrack(req, env, ctx, tripId) {
   const seconds = Number(env.TRACK_CACHE_SECONDS || 10);
   return cached(req, ctx, `https://cache.internal/track/${encodeURIComponent(tripId)}`, seconds, async () => {
     const row = await env.DB.prepare(
-      `SELECT l.trip_id, l.lat, l.lng, l.speed, l.recorded_at, l.shared
-         FROM live_positions l JOIN companies c ON c.id = l.company_id
-        WHERE l.trip_id = ?1 AND c.status = 'active'`
+      'SELECT trip_id, company_id, lat, lng, speed, recorded_at, shared FROM live_positions WHERE trip_id = ?1'
     ).bind(tripId).first();
-    if (!row) return json({ error: 'no position yet' }, 404);
-    return json(row, 200, { etag: `"${row.recorded_at}"` });
+    if (!row || (await meta(env)).suspended.has(row.company_id)) return json({ error: 'no position yet' }, 404);
+    const { company_id, ...pub } = row;
+    return json(pub, 200, { etag: `"${row.recorded_at}"` });
   });
 }
 
@@ -188,6 +197,7 @@ export default {
     if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
     const url = new URL(req.url);
     try {
+      if (req.method === 'POST' && url.pathname === '/api/trip-token') return await postTripToken(req, env);
       if (req.method === 'POST' && url.pathname === '/api/loc') return await postLocation(req, env);
       if (req.method === 'POST' && url.pathname === '/api/loc/share') return await postShare(req, env);
       if (req.method === 'GET' && url.pathname === '/api/live') return await getLive(req, env, ctx);

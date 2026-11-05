@@ -2,10 +2,14 @@
 // and sends them in batches. Works in a PWA, React Native or any JS runtime:
 // you pass in `send` (network call) and `store` (persistence).
 //
+//   // once at trip start, with the supervisor's device token:
+//   const { token: tripToken } = await fetch(API + '/api/trip-token', { method: 'POST',
+//              headers: { authorization: 'Bearer ' + deviceToken, 'content-type': 'application/json' },
+//              body: JSON.stringify({ trip_id: tripId }) }).then((r) => r.json());
 //   const sender = createSender({
 //     send: (points) => fetch(API + '/api/loc', { method: 'POST',
-//              headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
-//              body: JSON.stringify({ trip_id: tripId, points }) }).then((r) => r.ok),
+//              headers: { authorization: 'Bearer ' + tripToken, 'content-type': 'application/json' },
+//              body: JSON.stringify({ points }) }).then((r) => r.ok),
 //     store: { load: () => JSON.parse(localStorage.getItem('locq') || '[]'),
 //              save: (q) => localStorage.setItem('locq', JSON.stringify(q)) },
 //   });
@@ -32,10 +36,12 @@ export function createSender({
   maxAccuracyM = 100,
   maxBatch = 200,
   maxQueue = 2_000,            // about 6–7 hours of offline driving
+  historyEveryMs = 60_000,     // mark one point a minute for the track history (h: 1)
 }) {
   let queue = (store.load() || []).slice(-maxQueue);
   let lastSent = null;
   let lastSentAt = -Infinity;
+  let lastHistT = -Infinity;
   let flushing = null;
 
   async function onPosition(p) {
@@ -44,7 +50,10 @@ export function createSender({
     const moving = (p.speed ?? 0) >= movingKmh || moved >= minMoveM;
     const interval = moving ? movingIntervalMs : idleIntervalMs;
     if (now() - lastSentAt < interval) return 'wait';
-    queue.push({ lat: p.lat, lng: p.lng, speed: p.speed ?? null, heading: p.heading ?? null, accuracy: p.accuracy ?? null, t: p.t ?? now() });
+    const t = p.t ?? now();
+    const h = t - lastHistT >= historyEveryMs ? 1 : 0;
+    if (h) lastHistT = t;
+    queue.push({ lat: p.lat, lng: p.lng, speed: p.speed ?? null, heading: p.heading ?? null, accuracy: p.accuracy ?? null, t, h });
     if (queue.length > maxQueue) queue = queue.slice(-maxQueue);
     store.save(queue);
     lastSent = p;

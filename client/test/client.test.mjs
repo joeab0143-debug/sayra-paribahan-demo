@@ -21,6 +21,7 @@ test('sender: moving bus sends every 12 s, standing bus every 60 s', async () =>
   t = 42_000; assert.equal(await s.onPosition({ lat: 22.702, lng: 89.07, speed: 0, t }), 'wait');
   t = 72_000; assert.equal(await s.onPosition({ lat: 22.702, lng: 89.07, speed: 0, t }), 'sent');
   assert.equal(sent.length, 3);
+  assert.deepEqual(sent.map((p) => p.h), [1, 0, 1], 'one history point a minute');
 });
 
 test('sender: drops inaccurate fixes', async () => {
